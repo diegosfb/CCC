@@ -1,121 +1,116 @@
-"""Utilities for inspecting Python environments and creating reproduction scripts."""
-
-from __future__ import annotations
-
+import json
 import os
 import subprocess
-import sys
-from pathlib import Path
-from typing import Callable, List, Sequence
+from dataclasses import dataclass
+from typing import Callable, Dict, Iterable, List, Optional
 
 
-class EnvironmentInspector:
-    """Collects details about Python environments and generates reproduction assets."""
+@dataclass
+class PythonEnvironment:
+    """Represents a Python environment and provides inspection utilities."""
 
-    def __init__(self, runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run) -> None:
-        """Initialize the inspector with a subprocess runner."""
-        self._runner = runner
+    name: str
+    path: str
+    python_executable: str
 
-    def get_python_version(self, python_executable: str) -> str:
-        """Return the Python version for the provided executable."""
-        result = self._runner(
-            [python_executable, "--version"],
+    def get_python_version(self, runner: Callable[..., subprocess.CompletedProcess] = subprocess.run) -> str:
+        """Return the Python version for this environment."""
+        completed = runner(
+            [self.python_executable, "--version"],
             capture_output=True,
             text=True,
-            check=True,
+            check=False,
         )
-        # The version can appear in stdout or stderr depending on the platform.
-        output = result.stdout.strip() or result.stderr.strip()
-        return output
+        output = (completed.stdout or "").strip() or (completed.stderr or "").strip()
+        return output.replace("Python ", "", 1) if output.startswith("Python ") else output
 
-    def get_installed_packages(self, python_executable: str) -> List[str]:
-        """Return a list of installed packages for the provided executable."""
-        result = self._runner(
-            [python_executable, "-m", "pip", "freeze"],
+    def get_installed_packages(
+        self, runner: Callable[..., subprocess.CompletedProcess] = subprocess.run
+    ) -> List[str]:
+        """Return a sorted list of installed packages (pip freeze format)."""
+        completed = runner(
+            [self.python_executable, "-m", "pip", "freeze"],
             capture_output=True,
             text=True,
-            check=True,
+            check=False,
         )
-        # Filter out empty lines to avoid blank entries.
-        return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        packages = [line.strip() for line in (completed.stdout or "").splitlines() if line.strip()]
+        return sorted(packages)
 
-    def build_reproduction_list(self, python_version: str, packages: Sequence[str]) -> List[str]:
-        """Build a list describing the configuration and installations needed."""
-        reproduction_list = [f"Python version: {python_version}", "Installations:"]
-        if packages:
-            reproduction_list.extend(f"- {package}" for package in packages)
-        else:
-            reproduction_list.append("- No third-party packages detected.")
-        return reproduction_list
+    def generate_reproduction_instructions(
+        self, runner: Callable[..., subprocess.CompletedProcess] = subprocess.run
+    ) -> Dict[str, Iterable[str]]:
+        """Generate a list of configuration and installation steps to reproduce the environment."""
+        python_version = self.get_python_version(runner)
+        packages = self.get_installed_packages(runner)
+        instructions = {
+            "python_version": python_version,
+            "packages": packages,
+            "create_command": f"python -m venv {self.name}",
+            "activate_command": f"source {self.name}/bin/activate",
+            "install_command": "pip install -r requirements.txt",
+        }
+        return instructions
 
-    def generate_creation_script(
+
+class PythonEnvironmentLister:
+    """Finds Python environments and retrieves reproduction details."""
+
+    def __init__(
         self,
-        env_name: str,
-        packages: Sequence[str],
-        output_dir: str | Path,
-    ) -> Path:
-        """Generate a creation script for the given environment name."""
-        output_path = Path(output_dir) / f"{env_name}.creation-script.py"
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        script_content = create_creation_script_content(env_name, packages)
-        output_path.write_text(script_content, encoding="utf-8")
-        return output_path
+        search_paths: Optional[Iterable[str]] = None,
+        file_system: Optional[object] = None,
+    ) -> None:
+        """Initialize the lister with search paths and a filesystem module."""
+        self.search_paths = list(search_paths) if search_paths else [os.path.expanduser("~")]
+        self.file_system = file_system or os
+
+    def find_environments(self) -> List[PythonEnvironment]:
+        """Discover Python environments under the configured search paths."""
+        environments: List[PythonEnvironment] = []
+        for root_path in self.search_paths:
+            for dirpath, _, filenames in self.file_system.walk(root_path):
+                if "pyvenv.cfg" not in filenames:
+                    continue
+                python_executable = self._python_executable_for_env(dirpath)
+                if not python_executable:
+                    continue
+                name = self.file_system.path.basename(dirpath)
+                environments.append(PythonEnvironment(name=name, path=dirpath, python_executable=python_executable))
+        return environments
+
+    def _python_executable_for_env(self, env_path: str) -> Optional[str]:
+        """Return the python executable for a virtual environment, if it exists."""
+        candidate = self.file_system.path.join(env_path, "bin", "python")
+        if self.file_system.path.isfile(candidate):
+            return candidate
+        return None
 
 
-def create_creation_script_content(env_name: str, packages: Sequence[str]) -> str:
-    """Create the content for a Python environment creation script."""
-    packages_list = list(packages)
-    return (
-        f'"""Creation script for environment \"{env_name}\"."""\n\n'
-        "import os\n"
-        "import subprocess\n"
-        "import sys\n"
-        "from pathlib import Path\n\n"
-        "def _get_pip_executable(env_path: Path) -> Path:\n"
-        "    \"\"\"Return the pip executable path for the environment.\"\"\"\n"
-        "    if os.name == \"nt\":\n"
-        "        return env_path / \"Scripts\" / \"pip\"\n"
-        "    return env_path / \"bin\" / \"pip\"\n\n"
-        "def main() -> None:\n"
-        "    \"\"\"Create the virtual environment and install required packages.\"\"\"\n"
-        f"    env_path = Path(\"{env_name}\")\n"
-        "    if not env_path.exists():\n"
-        "        subprocess.run([sys.executable, \"-m\", \"venv\", str(env_path)], check=True)\n"
-        "    pip_executable = _get_pip_executable(env_path)\n"
-        f"    packages = {packages_list!r}\n"
-        "    if packages:\n"
-        "        subprocess.run([str(pip_executable), \"install\", *packages], check=True)\n\n"
-        "if __name__ == \"__main__\":\n"
-        "    main()\n"
-    )
-
-
-def generate_environment_assets(
-    env_name: str,
-    python_executable: str,
-    output_dir: str | Path,
-    inspector: EnvironmentInspector | None = None,
-) -> dict:
-    """Generate reproduction details and a creation script for an environment."""
-    inspector = inspector or EnvironmentInspector()
-    python_version = inspector.get_python_version(python_executable)
-    packages = inspector.get_installed_packages(python_executable)
-    reproduction_list = inspector.build_reproduction_list(python_version, packages)
-    script_path = inspector.generate_creation_script(env_name, packages, output_dir)
-    return {"reproduction_list": reproduction_list, "script_path": script_path}
+def list_available_environments(
+    search_paths: Optional[Iterable[str]] = None,
+    runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+) -> List[Dict[str, object]]:
+    """Return a list of environment details ready for reporting."""
+    lister = PythonEnvironmentLister(search_paths=search_paths)
+    results: List[Dict[str, object]] = []
+    for environment in lister.find_environments():
+        reproduction = environment.generate_reproduction_instructions(runner)
+        results.append(
+            {
+                "name": environment.name,
+                "path": environment.path,
+                "python_executable": environment.python_executable,
+                "reproduction": reproduction,
+            }
+        )
+    return results
 
 
 def main() -> None:
-    """Command-line entry point for generating environment reproduction assets."""
-    if len(sys.argv) < 2:
-        raise SystemExit("Usage: python python_env_lister.py <env-name> [python-executable] [output-dir]")
-    env_name = sys.argv[1]
-    python_executable = sys.argv[2] if len(sys.argv) > 2 else sys.executable
-    output_dir = sys.argv[3] if len(sys.argv) > 3 else os.getcwd()
-    assets = generate_environment_assets(env_name, python_executable, output_dir)
-    for line in assets["reproduction_list"]:
-        print(line)
-    print(f"Creation script written to: {assets['script_path']}")
+    """Entry point that prints environment details as JSON."""
+    environments = list_available_environments()
+    print(json.dumps(environments, indent=2))
 
 
 if __name__ == "__main__":
